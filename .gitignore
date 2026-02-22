@@ -1,7 +1,7 @@
 .DS_Store
 
 # Binaries
-nc-aws
+/nc-aws
 *.exe
 *.dll
 *.so
