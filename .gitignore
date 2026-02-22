@@ -2,6 +2,7 @@
 
 # Binaries
 /nc-aws
+/bin/nc-aws
 *.exe
 *.dll
 *.so
