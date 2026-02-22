@@ -1,0 +1,19 @@
+.DS_Store
+
+# Binaries
+nc-aws
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+
+# Local env/config
+.env
+.env.*
+
+# Editor/IDE
+.idea/
+.vscode/

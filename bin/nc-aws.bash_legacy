@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$ROOT_DIR/lib/aws.sh"
+
+LOG_FILE="${HOME}/.nc-aws.log"
+
+services=(s3 lambda vpc apigateway)
+active_panel="left"
+status_msg="Ready"
+
+L_profile=""
+L_region="us-east-1"
+L_service="s3"
+L_cursor=0
+L_error=""
+L_items=()
+
+R_profile=""
+R_region="us-east-1"
+R_service="s3"
+R_cursor=0
+R_error=""
+R_items=()
+
+log_msg() {
+  printf '[%s] %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"
+}
+
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+init_profiles() {
+  profiles=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && profiles+=("$line")
+  done < <(aws_profile_list)
+  if [[ ${#profiles[@]} -eq 0 ]]; then
+    profiles=(default)
+  fi
+
+  L_profile="${profiles[0]}"
+  if [[ ${#profiles[@]} -gt 1 ]]; then
+    R_profile="${profiles[1]}"
+  else
+    R_profile="${profiles[0]}"
+  fi
+
+  L_region="$(aws_profile_region "$L_profile")"
+  R_region="$(aws_profile_region "$R_profile")"
+}
+
+get_panel_var() {
+  local panel="$1"
+  local name="$2"
+  if [[ "$panel" == "left" ]]; then
+    printf '%s' "L_${name}"
+  else
+    printf '%s' "R_${name}"
+  fi
+}
+
+panel_get() {
+  local panel="$1"
+  local name="$2"
+  local var
+  var="$(get_panel_var "$panel" "$name")"
+  printf '%s' "${!var-}"
+}
+
+panel_set() {
+  local panel="$1"
+  local name="$2"
+  local value="$3"
+  local var
+  var="$(get_panel_var "$panel" "$name")"
+  printf -v "$var" '%s' "$value"
+}
+
+panel_items_name() {
+  local panel="$1"
+  if [[ "$panel" == "left" ]]; then
+    printf '%s' "L_items"
+  else
+    printf '%s' "R_items"
+  fi
+}
+
+set_items() {
+  local panel="$1"
+  shift
+  local arr_name
+  arr_name="$(panel_items_name "$panel")"
+  eval "$arr_name=()"
+  local x
+  for x in "$@"; do
+    eval "$arr_name+=(\"\$x\")"
+  done
+}
+
+get_item_count() {
+  local panel="$1"
+  local arr_name
+  arr_name="$(panel_items_name "$panel")"
+  eval "printf '%s' \"\${#$arr_name[@]}\""
+}
+
+get_item_at() {
+  local panel="$1"
+  local idx="$2"
+  local arr_name
+  arr_name="$(panel_items_name "$panel")"
+  eval "printf '%s' \"\${$arr_name[$idx]-}\""
+}
+
+selected_item() {
+  local panel="$1"
+  local cursor
+  cursor="$(panel_get "$panel" cursor)"
+  get_item_at "$panel" "$cursor"
+}
+
+refresh_panel() {
+  local panel="$1"
+  local profile region service
+  profile="$(aws_resolve_profile_case "$(panel_get "$panel" profile)")"
+  panel_set "$panel" profile "$profile"
+  region="$(panel_get "$panel" region)"
+  service="$(panel_get "$panel" service)"
+
+  log_msg "refresh panel=$panel profile=$profile region=$region service=$service"
+  local out
+  if out="$(aws_list_resources "$profile" "$region" "$service" 2>&1)"; then
+    rows=()
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && rows+=("$line")
+    done < <(printf '%s\n' "$out" | awk 'NF > 0')
+    set_items "$panel" "${rows[@]:-}"
+    panel_set "$panel" error ""
+    panel_set "$panel" cursor 0
+    status_msg="Loaded $service resources for $profile/$region"
+  else
+    set_items "$panel"
+    panel_set "$panel" error "$out"
+    panel_set "$panel" cursor 0
+    status_msg="Error loading $service for $profile/$region"
+    log_msg "error panel=$panel $out"
+  fi
+}
+
+refresh_all() {
+  refresh_panel left
+  refresh_panel right
+}
+
+panel_lines() {
+  local panel="$1"
+  local width="$2"
+  local active=" "
+  [[ "$panel" == "$active_panel" ]] && active=">"
+
+  local profile region service err cursor
+  profile="$(panel_get "$panel" profile)"
+  region="$(panel_get "$panel" region)"
+  service="$(panel_get "$panel" service)"
+  err="$(panel_get "$panel" error)"
+  cursor="$(panel_get "$panel" cursor)"
+
+  printf '%s %s\n' "$active" "$(printf '%-s' "${panel^^} | profile=$profile region=$region service=$service")"
+  printf '%*s\n' "$width" | tr ' ' '-'
+
+  local count
+  count="$(get_item_count "$panel")"
+  local max_rows=22
+  local i
+  for ((i = 0; i < max_rows; i++)); do
+    if ((i < count)); then
+      local item marker
+      item="$(get_item_at "$panel" "$i")"
+      marker=" "
+      ((i == cursor)) && marker="*"
+      printf '%s %s\n' "$marker" "$item"
+    else
+      printf '~\n'
+    fi
+  done
+
+  if [[ -n "$err" ]]; then
+    printf 'ERR: %s\n' "$(printf '%s' "$err" | head -n 1)"
+  fi
+}
+
+draw_ui() {
+  clear
+  local cols
+  cols="$(tput cols)"
+  local half=$((cols / 2 - 2))
+
+  printf 'AWS Commander (Terminal)\n'
+  printf -- '%s\n' '--------------------------------------------------------------------------------'
+
+  local left_file right_file
+  left_file="$(mktemp)"
+  right_file="$(mktemp)"
+  panel_lines left "$half" >"$left_file"
+  panel_lines right "$half" >"$right_file"
+
+  pr -m -t -w "$cols" "$left_file" "$right_file"
+  rm -f "$left_file" "$right_file"
+
+  printf -- '%s\n' '--------------------------------------------------------------------------------'
+  printf 'Keys: [tab] switch panel | j/k move | p profile | r region | s service | v view\n'
+  printf '      n create | d delete | c copy (S3) | g refresh | q quit\n'
+  printf 'Status: %s\n' "$status_msg"
+}
+
+choose_from_list() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+  if [[ ${#options[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  echo
+  printf '%s\n' "$prompt"
+  local i
+  for ((i = 0; i < ${#options[@]}; i++)); do
+    printf '  %d) %s\n' "$((i + 1))" "${options[$i]}"
+  done
+  printf 'Select number (empty to cancel): '
+  read -r selection
+  if [[ -z "$selection" ]]; then
+    return 1
+  fi
+  if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  local idx=$((selection - 1))
+  if ((idx < 0 || idx >= ${#options[@]})); then
+    return 1
+  fi
+  printf '%s\n' "${options[$idx]}"
+}
+
+change_profile() {
+  local panel="$1"
+  local picked
+  if picked="$(choose_from_list "Profiles" "${profiles[@]}")"; then
+    panel_set "$panel" profile "$picked"
+    panel_set "$panel" region "$(aws_profile_region "$picked")"
+    refresh_panel "$panel"
+  else
+    status_msg="Profile change canceled"
+  fi
+}
+
+change_region() {
+  local panel="$1"
+  local profile
+  profile="$(panel_get "$panel" profile)"
+  regions=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && regions+=("$line")
+  done < <(aws_regions_for_profile "$profile")
+  local picked
+  if picked="$(choose_from_list "Regions for $profile" "${regions[@]}")"; then
+    panel_set "$panel" region "$picked"
+    refresh_panel "$panel"
+  else
+    status_msg="Region change canceled"
+  fi
+}
+
+change_service() {
+  local panel="$1"
+  local picked
+  if picked="$(choose_from_list "Services" "${services[@]}")"; then
+    panel_set "$panel" service "$picked"
+    refresh_panel "$panel"
+  else
+    status_msg="Service change canceled"
+  fi
+}
+
+move_cursor() {
+  local panel="$1"
+  local delta="$2"
+  local count cursor
+  count="$(get_item_count "$panel")"
+  ((count == 0)) && return
+  cursor="$(panel_get "$panel" cursor)"
+  cursor=$((cursor + delta))
+  ((cursor < 0)) && cursor=0
+  ((cursor >= count)) && cursor=$((count - 1))
+  panel_set "$panel" cursor "$cursor"
+}
+
+view_detail() {
+  local panel="$1"
+  local item
+  item="$(selected_item "$panel")"
+  if [[ -z "$item" ]]; then
+    status_msg="No resource selected"
+    return
+  fi
+
+  local profile region service
+  profile="$(panel_get "$panel" profile)"
+  region="$(panel_get "$panel" region)"
+  service="$(panel_get "$panel" service)"
+
+  clear
+  printf 'Detail: %s (%s)\n\n' "$item" "$service"
+  if ! aws_get_resource_detail "$profile" "$region" "$service" "$item"; then
+    printf '\nError retrieving detail\n'
+  fi
+  printf '\nPress enter to continue...'
+  read -r _
+}
+
+create_resource() {
+  local panel="$1"
+  local service profile region name
+  service="$(panel_get "$panel" service)"
+  profile="$(panel_get "$panel" profile)"
+  region="$(panel_get "$panel" region)"
+
+  if [[ "$service" != "s3" ]]; then
+    status_msg="Create only implemented for S3"
+    return
+  fi
+
+  printf '\nNew S3 bucket name: '
+  read -r name
+  if [[ -z "$name" ]]; then
+    status_msg="Create canceled"
+    return
+  fi
+
+  if aws_create_resource "$profile" "$region" "$service" "$name" >/dev/null 2>&1; then
+    status_msg="Bucket created: $name"
+    refresh_panel "$panel"
+  else
+    status_msg="Create failed for $name"
+  fi
+}
+
+delete_resource() {
+  local panel="$1"
+  local item service profile region
+  item="$(selected_item "$panel")"
+  if [[ -z "$item" ]]; then
+    status_msg="No resource selected"
+    return
+  fi
+
+  service="$(panel_get "$panel" service)"
+  profile="$(panel_get "$panel" profile)"
+  region="$(panel_get "$panel" region)"
+
+  printf '\nDelete %s (%s)? [y/N]: ' "$item" "$service"
+  read -r confirm
+  if [[ "$(lower "$confirm")" != "y" ]]; then
+    status_msg="Delete canceled"
+    return
+  fi
+
+  if aws_delete_resource "$profile" "$region" "$service" "$item" >/dev/null 2>&1; then
+    status_msg="Deleted: $item"
+    refresh_panel "$panel"
+  else
+    status_msg="Delete failed: $item"
+  fi
+}
+
+copy_resource() {
+  local src_panel="$1"
+  local dst_panel="right"
+  [[ "$src_panel" == "right" ]] && dst_panel="left"
+
+  local service item src_profile src_region dst_profile dst_region target
+  service="$(panel_get "$src_panel" service)"
+  item="$(selected_item "$src_panel")"
+  src_profile="$(panel_get "$src_panel" profile)"
+  src_region="$(panel_get "$src_panel" region)"
+  dst_profile="$(panel_get "$dst_panel" profile)"
+  dst_region="$(panel_get "$dst_panel" region)"
+
+  if [[ -z "$item" ]]; then
+    status_msg="No resource selected"
+    return
+  fi
+
+  if [[ "$service" != "s3" ]]; then
+    status_msg="Copy currently implemented only for S3"
+    return
+  fi
+
+  printf '\nCopy S3 bucket template %s -> %s/%s\n' "$item" "$dst_profile" "$dst_region"
+  printf 'Target bucket name [%s]: ' "$item"
+  read -r target
+  [[ -z "$target" ]] && target="$item"
+
+  if aws_create_resource "$dst_profile" "$dst_region" s3 "$target" >/dev/null 2>&1; then
+    status_msg="Copied bucket template to $target"
+    refresh_panel "$dst_panel"
+  else
+    status_msg="Copy failed to $target"
+  fi
+}
+
+handle_key() {
+  local key="$1"
+  case "$key" in
+    q) return 1 ;;
+    "\t")
+      if [[ "$active_panel" == "left" ]]; then
+        active_panel="right"
+      else
+        active_panel="left"
+      fi
+      status_msg="Active panel: $active_panel"
+      ;;
+    j) move_cursor "$active_panel" 1 ;;
+    k) move_cursor "$active_panel" -1 ;;
+    p) change_profile "$active_panel" ;;
+    r) change_region "$active_panel" ;;
+    s) change_service "$active_panel" ;;
+    v|"") view_detail "$active_panel" ;;
+    n) create_resource "$active_panel" ;;
+    d) delete_resource "$active_panel" ;;
+    c) copy_resource "$active_panel" ;;
+    g) refresh_panel "$active_panel" ;;
+  esac
+  return 0
+}
+
+main() {
+  touch "$LOG_FILE"
+  init_profiles
+  refresh_all
+
+  while true; do
+    draw_ui
+    IFS= read -rsn1 key || true
+
+    if [[ "$key" == $'\e' ]]; then
+      read -rsn2 rest || true
+      case "$rest" in
+        "[A") key="k" ;;
+        "[B") key="j" ;;
+      esac
+    fi
+
+    if ! handle_key "$key"; then
+      break
+    fi
+  done
+
+  clear
+  printf 'Bye. Log: %s\n' "$LOG_FILE"
+}
+
+main "$@"
